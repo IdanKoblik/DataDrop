@@ -21,7 +21,7 @@ func (b *BenchmarkStats) PrintStats(mode bool) {
 	if !mode {
 		return
 	}
-	
+
 	fmt.Printf("\nBenchmark Results:\n")
 	fmt.Printf("  Total Time: %v\n", b.TotalTime)
 	fmt.Printf("  Transfer Speed: %.2f bytes/sec\n", b.TransferSpeed)

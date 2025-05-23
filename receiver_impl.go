@@ -1,92 +1,122 @@
 package main
 
 import (
+	"context"
+	"echo/fileproto"
 	"echo/internals"
 	"fmt"
-	"net"
 	"os"
 	"path/filepath"
 	"time"
 )
 
-func Receive(conn *net.UDPConn, benchmark bool) error {
-	var outputFile *os.File
-	var fileName string
-
-	homeDir, err := os.UserHomeDir()
+func Receive(localAddr string, benchmark bool) error {
+	qm, err := InitServer(localAddr)
 	if err != nil {
 		return err
 	}
 
-	chunks := make(map[int][]byte)
-	buffer := make([]byte, 2048)
-	count := 0
-	var expectedChunks int
+	defer qm.Close()
 
+	conn, err := qm.AcceptConnection(context.Background())
+	if err != nil {
+		return err
+	}
+
+	defer conn.CloseWithError(0, "transfer complete")
+
+	stream, err := conn.AcceptStream(context.Background())
+	if err != nil {
+		return err
+	}
+
+	defer stream.Close()
+
+	start := time.Now()
 	stats := &BenchmarkStats{}
-	var start time.Time
-	flag := false
+
+	var outputFile *os.File
+	var expectedFilename string
+	var totalChunks uint32
+	chunks := make(map[uint32][]byte)
 
 	for {
-		msg, _, err := internals.ReceivePacket(conn, buffer)
-		if err != nil {
+		var chunk fileproto.FileChunk
+		if err := internals.ReceivePacket(stream, &chunk); err != nil {
 			return err
 		}
 
-		if msg.Version != VERSION {
-			return fmt.Errorf("protocol version mismatch :(")
+		chunkStart := time.Now()
+		if chunk.Version != VERSION {
+			return fmt.Errorf("Version mismatch, expected: %d, actual: %d", VERSION, chunk.Version)
 		}
 
-		if !flag {
-			flag = true
-			start = time.Now()
+		if chunk.ChunkIndex == 0 && chunk.Checksum == "eof" {
+			totalChunks = chunk.TotalChunks
+			fmt.Printf("Received EOF marker. Expected %d chunks total.\n", totalChunks)
+			break
+		}
+
+		if !internals.ValidateChecksum(&chunk) {
+			return fmt.Errorf("checksum validation failed for chunk %d", chunk.ChunkIndex)
 		}
 
 		if outputFile == nil {
-			fileName = msg.Filename
-			filePath := filepath.Join(homeDir, filepath.Base(fileName))
+			expectedFilename = chunk.Filename
+			homeDir, err := os.UserHomeDir()
+			if err != nil {
+				return err
+			}
+
+			filePath := filepath.Join(homeDir, expectedFilename)
 			outputFile, err = os.Create(filePath)
 			if err != nil {
-				return fmt.Errorf("failed to create file: %v", err)
+				return fmt.Errorf("failed to create file: %w", err)
 			}
 			defer outputFile.Close()
 
-			expectedChunks = int(msg.TotalChunks)
+			fmt.Printf("Receiving file: %s\n", expectedFilename)
 		}
 
-		if _, exists := chunks[int(msg.ChunkIndex)]; !exists {
-			chunks[int(msg.ChunkIndex)] = msg.Data
-			stats.ChunkTimings = append(stats.ChunkTimings, time.Since(start))
-			count++
-			stats.PacketsReceived++
+		if chunk.Filename != expectedFilename {
+			return fmt.Errorf("filename mismatch: expected %s, got %s",
+				expectedFilename, chunk.Filename)
 		}
 
-		if count == expectedChunks {
-			break
+		// Store chunk data
+		chunks[chunk.ChunkIndex] = chunk.Data
+		stats.ChunkTimings = append(stats.ChunkTimings, time.Since(chunkStart))
+		stats.PacketsReceived++
+		stats.TotalBytes += int64(len(chunk.Data))
+
+		// Progress indicator
+		if len(chunks)%100 == 0 {
+			fmt.Printf("Received %d chunks...\n", len(chunks))
 		}
 	}
 
-	flag = false
-	duration := time.Since(start)
-
-	for i := 1; i <= expectedChunks; i++ {
+	fmt.Println("Writing chunks to file...")
+	for i := uint32(1); i <= totalChunks; i++ {
 		data, exists := chunks[i]
 		if !exists {
 			return fmt.Errorf("missing chunk at index %d", i)
 		}
-		if _, err := outputFile.Write(data); err != nil {
-			return fmt.Errorf("failed to write chunk %d: %v", i, err)
-		}
 
-		stats.TotalBytes += int64(len(data))
+		if _, err := outputFile.Write(data); err != nil {
+			return fmt.Errorf("failed to write chunk %d: %w", i, err)
+		}
 	}
 
+	duration := time.Since(start)
 	stats.TotalTime = duration
-	stats.PacketLoss = (1 - float64(stats.PacketsReceived)/float64(expectedChunks)) * 100
 	stats.CpuUsage = getCpuUsage()
 	stats.MemoryUsage = GetMemoryUsage()
-
 	stats.PrintStats(benchmark)
+
+	homeDir, _ := os.UserHomeDir()
+	filePath := filepath.Join(homeDir, expectedFilename)
+	fmt.Printf("File received successfully: %s (%d bytes) in %.2fs\n",
+		filePath, stats.TotalBytes, duration.Seconds())
 
 	return nil
 }

@@ -1,112 +1,98 @@
 package main
 
 import (
+	"context"
+	"echo/fileproto"
 	"echo/internals"
 	"fmt"
 	"io"
-	"net"
 	"os"
-	"sync"
+	"path/filepath"
 	"time"
 )
 
-func Send(filename string, conn *net.UDPConn, remoteAddr string, benchmark bool) error {
+func Send(filename, remoteAddr string, benchmark bool) error {
 	start := time.Now()
-
 	file, err := os.Open(filename)
 	if err != nil {
 		return err
 	}
+
 	defer file.Close()
 
-	raddr, err := net.ResolveUDPAddr("udp", remoteAddr)
+	fileInfo, err := file.Stat()
 	if err != nil {
 		return err
 	}
 
-	const chunkSize = 1400
-	buffer := make([]byte, chunkSize)
-	var chunks []internals.Chunk
-	index := 0
+	qm, err := InitClient(remoteAddr)
+	if err != nil {
+		return err
+	}
+
+	defer qm.Close()
+
+	stream, err := qm.GetConnection().OpenStreamSync(context.Background())
+	if err != nil {
+		return err
+	}
 
 	stats := &BenchmarkStats{}
+	const chunkSize = 64 * 1024
+	totalChunks := uint32((fileInfo.Size() + chunkSize - 1) / chunkSize)
+	baseFilename := filepath.Base(filename)
+
+	fmt.Printf("Sending file: %s (%d bytes) in %d chunks\n", baseFilename, fileInfo.Size(), totalChunks)
+	buffer := make([]byte, chunkSize)
+	var chunkIndex uint32 = 1
 
 	for {
-		num, err := file.Read(buffer)
+		chunkStart := time.Now()
+		n, err := file.Read(buffer)
 		if err == io.EOF {
 			break
 		}
+
 		if err != nil {
 			return err
 		}
 
-		data := make([]byte, num)
-		copy(data, buffer[:num])
-		index++
+		chunk := internals.CreateFileChunk(
+			VERSION,
+			baseFilename,
+			chunkIndex,
+			totalChunks,
+			buffer[:n],
+		)
 
-		chunks = append(chunks, internals.Chunk{
-			Data:  data,
-			Index: index,
-		})
-	}
-
-	chunkCount := len(chunks)
-	uploadMbps, rttMs, err := MeasureUpload(); if err != nil {
-		return err
-	}
-
-	chunksPerSecond := (uploadMbps * 125000) / float64(chunkSize)
-	acksPerWorker := 1000.0 / rttMs
-	optimalWorkersFloat := chunksPerSecond / acksPerWorker
-	optimalWorkers := int(optimalWorkersFloat)
-	if optimalWorkers < 1 {
-		optimalWorkers = 1
-	}
-	
-	chunksPerWorker := (chunkCount + optimalWorkers - 1) / optimalWorkers
-	ackManager := internals.NewAckManager()
-	go ackManager.Listen(conn)
-
-	
-	fmt.Println("Number of workers: ", optimalWorkers)
-	var wg sync.WaitGroup
-	for w := 0; w < optimalWorkers; w++ {
-		start := w * chunksPerWorker
-		end := (w + 1) * chunksPerWorker
-		if end > chunkCount {
-			end = chunkCount
+		if err := internals.SendPacket(stream, chunk); err != nil {
+			return err
 		}
 
-		if start >= chunkCount {
-			break
+		stats.ChunkTimings = append(stats.ChunkTimings, time.Since(chunkStart))
+		stats.PacketsSent++
+		stats.TotalBytes += int64(n)
+
+		chunkIndex++
+
+		if chunkIndex%100 == 0 {
+			progress := float64(chunkIndex) / float64(totalChunks) * 100
+			fmt.Printf("Progress: %.1f%% (%d/%d chunks)\n", progress, chunkIndex-1, totalChunks)
 		}
-
-		assignedChunks := chunks[start:end]
-		wg.Add(1)
-		go func(workerChunks []internals.Chunk) {
-			defer wg.Done()
-			var totalBytesTransferred int64
-			var totalPacketsSent int
-
-			for _, chunk := range workerChunks {
-				start := time.Now()
-				err := internals.SendPacket(conn, raddr, &chunk, uint32(chunkCount), file, VERSION, ackManager)
-				if err != nil {
-					fmt.Println("Send error:", err)
-					return
-				}
-
-				stats.ChunkTimings = append(stats.ChunkTimings, time.Since(start))
-				totalBytesTransferred += int64(len(chunk.Data))
-				totalPacketsSent++
-			}
-
-			stats.TotalBytes += totalBytesTransferred
-			stats.PacketsSent += totalPacketsSent
-		}(assignedChunks)
 	}
 
-	wg.Wait()
+	eofChunk := &fileproto.FileChunk{
+		Version:     VERSION,
+		Filename:    baseFilename,
+		ChunkIndex:  0, // Special index for EOF
+		TotalChunks: totalChunks,
+		Data:        []byte{},
+		Checksum:    "eof",
+	}
+
+	if err := internals.SendPacket(stream, eofChunk); err != nil {
+		return fmt.Errorf("failed to send EOF marker: %w", err)
+	}
 
 	duration := time.Since(start)
 	stats.TotalTime = duration
@@ -114,6 +100,9 @@ func Send(filename string, conn *net.UDPConn, remoteAddr string, benchmark bool)
 	stats.MemoryUsage = GetMemoryUsage()
 	stats.CpuUsage = getCpuUsage()
 	stats.PrintStats(benchmark)
+
+	fmt.Printf("File sent successfully: %s (%d bytes) in %.2fs\n",
+		filename, stats.TotalBytes, duration.Seconds())
 
 	return nil
 }

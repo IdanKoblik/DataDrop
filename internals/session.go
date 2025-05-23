@@ -1,12 +1,11 @@
 package internals
 
 import (
+	"crypto/md5"
 	"echo/fileproto"
-	"echo/utils"
+	"encoding/binary"
 	"fmt"
-	"net"
-	"os"
-	"time"
+	"io"
 
 	"google.golang.org/protobuf/proto"
 )
@@ -18,70 +17,61 @@ type Chunk struct {
 	Data  []byte
 }
 
-func SendPacket(conn *net.UDPConn, raddr *net.UDPAddr, chunk *Chunk, totalChunks uint32, file *os.File, version uint32, ackManager *AckManager) error {
-	checksum := utils.CalculateChecksum(chunk.Data)
-
-	msg := &fileproto.FileChunk{
-		Version:     version,
-		Filename:    file.Name(),
-		ChunkIndex:  uint32(chunk.Index),
-		TotalChunks: totalChunks,
-		Data:        chunk.Data,
-		Checksum:    checksum,
-	}
-
-	encoded, err := proto.Marshal(msg)
+func SendPacket(stream io.Writer, msg proto.Message) error {
+	data, err := proto.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	ch := ackManager.Register(uint32(chunk.Index))
-	for retries := 0; retries < maxRetries; retries++ {
-		_, err := conn.WriteToUDP(encoded, raddr)
-		if err != nil {
-			return err
-		}
-	
-		select {
-		case <-ch:
-			return nil 
-		case <-time.After(2 * time.Second):
-			fmt.Printf("Retry chunk %d (attempt %d)\n", chunk.Index, retries+2)
-		}
+	if err := binary.Write(stream, binary.LittleEndian, uint32(len(data))); err != nil {
+		return err
 	}
-	
+
+	if _, err := stream.Write(data); err != nil {
+		return err
+	}
+
 	return nil
 }
 
-func ReceivePacket(conn *net.UDPConn, buffer []byte) (*fileproto.FileChunk, *net.UDPAddr, error) {
-	num, client, err := conn.ReadFromUDP(buffer)
-	if err != nil {
-		return nil, nil, err
+func ReceivePacket(stream io.Reader, msg proto.Message) error {
+	var msgLen uint32
+	if err := binary.Read(stream, binary.LittleEndian, &msgLen); err != nil {
+		return err
 	}
 
-	var msg fileproto.FileChunk
-	err = proto.Unmarshal(buffer[:num], &msg)
-	if err != nil {
-		return nil, nil, err
+	if msgLen > 10*1024*1024 {
+		return fmt.Errorf("message too large: %d bytes", msgLen)
 	}
 
-	checksum := utils.CalculateChecksum(msg.Data)
-	if checksum != msg.Checksum {
-		return nil, nil, fmt.Errorf("checksum mismatch on chunk %d: expected %s, got %s", msg.ChunkIndex, msg.Checksum, checksum)
+	data := make([]byte, msgLen)
+	if _, err := io.ReadFull(stream, data); err != nil {
+		return err
 	}
 
-	ack := &fileproto.FileAck{
-		ChunkIndex: msg.ChunkIndex,
-	}
-	encodedAck, err := proto.Marshal(ack)
-	if err != nil {
-		return nil, nil, err
+	if err := proto.Unmarshal(data, msg); err != nil {
+		return err
 	}
 
-	_, err = conn.WriteToUDP(encodedAck, client)
-	if err != nil {
-		return nil, nil, err
-	}
+	return nil
+}
 
-	return &msg, client, nil
+func CreateFileChunk(version uint32, filename string, chunkIndex, totalChunks uint32, data []byte) *fileproto.FileChunk {
+	hash := md5.Sum(data)
+	checksum := fmt.Sprintf("%x", hash)
+
+	return &fileproto.FileChunk{
+		Version:     version,
+		Filename:    filename,
+		ChunkIndex:  chunkIndex,
+		TotalChunks: totalChunks,
+		Data:        data,
+		Checksum:    checksum,
+	}
+}
+
+func ValidateChecksum(chunk *fileproto.FileChunk) bool {
+	hash := md5.Sum(chunk.Data)
+	expectedChecksum := fmt.Sprintf("%x", hash)
+	return expectedChecksum == chunk.Checksum
 }

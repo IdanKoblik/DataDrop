@@ -20,7 +20,7 @@ func TestPrintStats(t *testing.T) {
 		CpuUsage:        55.5,
 	}
 
-	old := os.Stdout 
+	old := os.Stdout
 	r, w, _ := os.Pipe()
 	os.Stdout = w
 
@@ -32,7 +32,7 @@ func TestPrintStats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to read from buffer: %v", err)
 	}
-	os.Stdout = old 
+	os.Stdout = old
 
 	output := buf.String()
 	if !containsAll(output,
